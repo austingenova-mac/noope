@@ -76,7 +76,14 @@ public enum ReadinessEngine {
     /// treated as "today" unless `today` (a YYYY-MM-DD string) is given.
     public static func evaluate(days: [DailyMetric], today: String? = nil) -> Readiness {
         let sorted = days.sorted { $0.day < $1.day }
-        guard let latest = today.flatMap({ t in sorted.first { $0.day == t } }) ?? sorted.last else {
+        // When an explicit `today` is given (the dashboard passes the device's real local day key), use
+        // the row for THAT day and nothing else: a stale historical import has no row for today, so the
+        // readiness card reads "insufficient" rather than synthesizing off the newest stored — possibly
+        // months-old — row (issue #23/#24). With no `today` (live-strap default callers) fall back to the
+        // most recent row exactly as before, so nothing wearing the strap nightly changes.
+        let latestRow: DailyMetric?
+        if let today { latestRow = sorted.first { $0.day == today } } else { latestRow = sorted.last }
+        guard let latest = latestRow else {
             return Readiness(level: .insufficient,
                              headline: "Readiness",
                              summary: "Wear the strap for a few nights and your readiness read will appear here.",

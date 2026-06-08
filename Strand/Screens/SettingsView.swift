@@ -208,6 +208,7 @@ struct SettingsView: View {
         if live.bonded && live.connected {
             return "Your strap is paired and sending data. Open Live for a real-time heart rate."
         }
+        if live.connected, let hint = live.pairingHint { return hint }
         if live.connected { return "Connected. Finishing the secure pairing handshake…" }
         if live.bonded { return "Previously paired but not currently connected. Re-scan to reconnect." }
         return "No strap connected. Put your WHOOP nearby and tap Re-scan to pair."

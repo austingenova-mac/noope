@@ -268,7 +268,8 @@ private fun MetricGrid(d: DailyMetric?, w: Window) {
 
 @Composable
 private fun ReadinessSection(days: List<DailyMetric>) {
-    val readiness = remember(days) { ReadinessEngine.evaluate(days) }
+    val todayKey = java.time.LocalDate.now().toString()
+    val readiness = remember(days, todayKey) { ReadinessEngine.evaluate(days, today = todayKey) }
     if (readiness.level == ReadinessEngine.Level.INSUFFICIENT) return
 
     SectionHeader("Readiness", overline = "Should you push today?")

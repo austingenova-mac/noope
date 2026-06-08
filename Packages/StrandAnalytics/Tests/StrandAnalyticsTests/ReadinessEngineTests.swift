@@ -61,6 +61,18 @@ final class ReadinessEngineTests: XCTestCase {
         XCTAssertTrue(r.signals.contains { $0.key == "respRate" })
     }
 
+    func testExplicitTodayWithoutMatchingRowIsInsufficient() {
+        // Stale historical import: newest row is 2024-03-29, but the device's real calendar day is later.
+        // An explicit `today` with no matching row must read INSUFFICIENT — NOT synthesize off the newest
+        // stored (stale) row (issue #23/#24).
+        let days = baseline(todayHrv: 72, todayRhr: 46, todayStrain: 10)
+        XCTAssertEqual(ReadinessEngine.evaluate(days: days, today: "2026-06-08").level, .insufficient)
+        // The day that IS present still computes (no regression for current data).
+        XCTAssertNotEqual(ReadinessEngine.evaluate(days: days, today: "2024-03-29").level, .insufficient)
+        // The legacy no-`today` path is unchanged — still falls back to the most recent row.
+        XCTAssertNotEqual(ReadinessEngine.evaluate(days: days).level, .insufficient)
+    }
+
     func testStatsHelpers() {
         XCTAssertEqual(ReadinessEngine.mean([2, 4, 6]), 4)
         XCTAssertEqual(ReadinessEngine.sampleSD([2, 4, 6])!, 2.0, accuracy: 0.0001)

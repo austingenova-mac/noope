@@ -77,7 +77,7 @@ struct TodayView: View {
 
     @ViewBuilder
     private var readinessSection: some View {
-        let r = ReadinessEngine.evaluate(days: repo.days)
+        let r = ReadinessEngine.evaluate(days: repo.days, today: Repository.localDayKey(Date()))
         if r.level != .insufficient {
             VStack(alignment: .leading, spacing: NoopMetrics.gap) {
                 SectionHeader("Readiness", overline: "Should you push today?")

@@ -99,6 +99,19 @@ class ReadinessEngineTest {
     }
 
     @Test
+    fun explicitTodayWithoutMatchingRowIsInsufficient() {
+        // Stale historical import: newest row is 2024-03-29, but the device's real calendar day is later.
+        // An explicit `today` with no matching row must read INSUFFICIENT — NOT synthesize off the newest
+        // stored (stale) row (issue #23/#24).
+        val days = baseline(todayHrv = 72.0, todayRhr = 46, todayStrain = 10.0)
+        assertEquals(ReadinessEngine.Level.INSUFFICIENT, ReadinessEngine.evaluate(days, today = "2026-06-08").level)
+        // The day that IS present still computes (no regression for current data).
+        assertTrue(ReadinessEngine.evaluate(days, today = "2024-03-29").level != ReadinessEngine.Level.INSUFFICIENT)
+        // The legacy no-`today` path is unchanged — still falls back to the most recent row.
+        assertTrue(ReadinessEngine.evaluate(days).level != ReadinessEngine.Level.INSUFFICIENT)
+    }
+
+    @Test
     fun statsHelpers() {
         assertEquals(4.0, ReadinessEngine.mean(listOf(2.0, 4.0, 6.0))!!, 1e-12)
         assertEquals(2.0, ReadinessEngine.sampleSD(listOf(2.0, 4.0, 6.0))!!, 0.0001)

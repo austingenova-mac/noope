@@ -76,7 +76,12 @@ object ReadinessEngine {
      */
     fun evaluate(days: List<DailyMetric>, today: String? = null): Readiness {
         val sorted = days.sortedBy { it.day }
-        val latest = (today?.let { t -> sorted.firstOrNull { it.day == t } }) ?: sorted.lastOrNull()
+        // When an explicit [today] is given (the dashboard passes the device's real local day key), use
+        // the row for THAT day and nothing else: a stale historical import has no row for today, so the
+        // readiness card reads "insufficient" rather than synthesizing off the newest stored — possibly
+        // months-old — row (issue #23/#24). With no [today] (live-strap default callers) fall back to the
+        // most recent row exactly as before, so nothing wearing the strap nightly changes.
+        val latest = if (today != null) sorted.firstOrNull { it.day == today } else sorted.lastOrNull()
         if (latest == null) {
             return Readiness(
                 level = Level.INSUFFICIENT,

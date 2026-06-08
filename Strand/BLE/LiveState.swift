@@ -44,6 +44,11 @@ public final class LiveState: ObservableObject {
     /// Settings "Export" / "Reveal" actions target this URL.
     @Published public var puffinCaptureURL: URL?
 
+    /// Set when a WHOOP 5/MG strap refuses the encrypted bond on first connect ("Encryption/Authentication
+    /// is insufficient") — CoreBluetooth won't start a fresh just-works bond against a strap still bonded to
+    /// the official WHOOP app. Surfaced as actionable pairing-mode guidance; cleared once the link bonds.
+    @Published public var pairingHint: String? = nil
+
     public init() {}
 
     /// Single funnel for battery readings — updates the published value AND notifies the hook,

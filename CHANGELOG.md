@@ -17,6 +17,30 @@ approximate; downloads are on the [Releases](https://github.com/NoopApp/noop/rel
 
 ---
 
+## 1.12 — WHOOP 5/MG heart rate on Mac + Readiness anchoring
+
+- **Fixed (macOS, WHOOP 5/MG): the connect bonding and actually streaming live HR.** The v1.5 attempt
+  bonded but still failed on real 5/MG hardware because it subscribed the protected puffin notify chars
+  (`fd4b0003/4/5/7`) at *discovery*, before the link was encrypted — the strap rejected them with
+  *"Authentication is insufficient"* and the bond write itself failed *"Encryption is insufficient."*
+  NOOP now (1) retains those chars but defers the subscribe until the `CLIENT_HELLO` `.withResponse`
+  write confirms in `didWriteValueFor`; (2) arms realtime HR post-bond with **puffin command framing**
+  (`puffinCommandFrame(TOGGLE_REALTIME_HR)`) — the `send()` guard previously dropped every 5/MG command,
+  so even a bonded strap never started streaming; and (3) surfaces actionable pairing-mode guidance when
+  the bond is refused (`Encryption/Authentication is insufficient`) — CoreBluetooth won't start a fresh
+  just-works bond against a strap still bonded to the official WHOOP app, so it must be in pairing mode
+  (blue LEDs, WHOOP app closed). Reimplemented from a 5/MG owner's hardware-verified flow (issue #17).
+  WHOOP 4.0 is untouched; the change is scoped entirely to the `.whoop5` path.
+- **Fixed (Mac + Android): the Readiness card still anchoring to the newest stored row.** v1.11 anchored
+  Today, the sparklines and the Trends windows to the device's real calendar day, but left
+  `ReadinessEngine` reading `sorted.last`, so the "Should you push today?" card still synthesised off a
+  stale import's newest day. Both platforms now pass the local day key into `evaluate(...)`, and the
+  engine treats an explicit-but-absent `today` as *insufficient* rather than falling back to the newest
+  row — so on a stale import the readiness card hides instead of showing an old day's read. No-op for
+  anyone wearing the strap nightly (today's row exists). Caught via @Brechard's PR #24 (issue #23/#24).
+
+---
+
 ## 1.11 — Today reflects today, not stale imports
 
 - **Fixed (Mac + Android): the dashboard treated the newest *imported* day as "today."** After a

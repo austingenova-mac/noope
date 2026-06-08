@@ -122,6 +122,9 @@ public final class BLEManager: NSObject, ObservableObject {
     private var reassembler = Reassembler()
     private var seq: UInt8 = 0
     private var didBond = false
+    /// WHOOP 5/MG only: realtime HR has been armed (puffin TOGGLE_REALTIME_HR sent) once for this
+    /// connection, so the post-bond callback re-firing on later `.withResponse` writes doesn't re-send it.
+    private var whoop5RealtimeArmed = false
     private var clockRequested = false
     private var intentionalDisconnect = false
     /// The strap family the user chose to pair. Drives which service we scan for
@@ -288,11 +291,20 @@ public final class BLEManager: NSObject, ObservableObject {
             log("send(\(command.label)) ignored — \(reason)")
             return
         }
-        // WHOOP 5.0/MG uses a different (CRC16/puffin) command framing we don't build yet. Never
-        // write a WHOOP4-framed command to a 5/MG strap — its live HR/battery come from the standard
-        // profiles, and the only frame we send it is the static CLIENT_HELLO. (EXPERIMENTAL)
-        guard selectedModel.deviceFamily == .whoop4 else {
-            log("send(\(command.label)) skipped — WHOOP 5/MG has no command framing yet")
+        // WHOOP 5.0/MG uses puffin (CRC16) command framing, not the WHOOP4 frame. We only send the
+        // realtime-HR toggle as puffin — it's the one command verified to make a bonded 5/MG strap start
+        // streaming HR (issue #17: confirmed on Android v1.10 and a 5/MG owner's macOS patch). Every other
+        // WHOOP4 command has no verified puffin equivalent, so we still drop it rather than write a blind
+        // guess — an unknown command can make the strap tear the link down. WHOOP 4.0 is unaffected.
+        if selectedModel.deviceFamily == .whoop5 {
+            guard command == .toggleRealtimeHR else {
+                log("send(\(command.label)) skipped — no WHOOP 5/MG framing for this command yet")
+                return
+            }
+            seq = seq &+ 1
+            let frame = puffinCommandFrame(cmd: command.rawValue, seq: seq, payload: payload)
+            p.writeValue(Data(frame), for: ch, type: writeType)
+            log("→ \(command.label) payload=\(hex(payload)) (puffin)")
             return
         }
         seq = seq &+ 1
@@ -718,6 +730,7 @@ extension BLEManager: CBCentralManagerDelegate {
         Task { @MainActor in await collector?.flush() }
         state.connected = false
         didBond = false
+        whoop5RealtimeArmed = false
         clockRequested = false
         connectHandshakeDone = false
         // Reset backfill state so the next connect starts a fresh offload.
@@ -855,18 +868,11 @@ extension BLEManager: CBPeripheralDelegate {
                     // and the old .withoutResponse write never triggered bonding, so it hung forever at
                     // "Finishing the secure pairing handshake…".
                     log("WHOOP 5/MG: writing CLIENT_HELLO to fd4b0002 with response (to trigger bonding, experimental).")
+                    state.pairingHint = nil   // fresh attempt; clear any stale pairing-mode guidance
                     peripheral.writeValue(Data(hello), for: c, type: .withResponse)
                 }
-                if PuffinExperiment.isEnabled {
-                    // OPT-IN probe (Settings → Experimental, off by default): ask the strap to start
-                    // its realtime stream with a puffin-framed TOGGLE_REALTIME_HR. A guess we cannot
-                    // verify without 5/MG hardware; written unacknowledged to fd4b0002 only.
-                    seq = seq &+ 1
-                    let probe = puffinCommandFrame(cmd: WhoopCommand.toggleRealtimeHR.rawValue,
-                                                   seq: seq, payload: [0x01])
-                    log("WHOOP 5/MG EXPERIMENT: sending puffin TOGGLE_REALTIME_HR to fd4b0002")
-                    peripheral.writeValue(Data(probe), for: c, type: .withoutResponse)
-                }
+                // The realtime-HR stream is armed POST-bond (in didWriteValueFor / startRealtime) with
+                // puffin framing — not here. Writing it pre-bond on an unauthenticated link did nothing.
             case BLEManager.cmdNotifyChar,
                  BLEManager.eventNotifyChar,
                  BLEManager.dataNotifyChar,
@@ -882,13 +888,12 @@ extension BLEManager: CBPeripheralDelegate {
                 }
                 requestNotify(c, on: peripheral, reason: "discovery")
             default:
-                // WHOOP 5.0/MG puffin notify characteristics (fd4b0003/0004/0005/0007). Remember them so
-                // didWriteValueFor can re-subscribe AFTER bonding. The attempt here (before the link is
-                // authenticated) is rejected with "Authentication is insufficient", but it also nudges
-                // CoreBluetooth toward pairing alongside the .withResponse CLIENT_HELLO above.
+                // WHOOP 5.0/MG puffin notify characteristics (fd4b0003/0004/0005/0007). Retain them but DO
+                // NOT subscribe yet — on an unauthenticated link the strap rejects them with "Authentication
+                // is insufficient", which (per a 5/MG owner's verified flow, issue #17) also wedges the bond.
+                // didWriteValueFor subscribes them once the CLIENT_HELLO .withResponse write confirms.
                 if BLEManager.whoop5NotifyChars.contains(c.uuid) {
                     whoop5NotifyCharacteristics.append(c)
-                    requestNotify(c, on: peripheral, reason: "discovery puffin")
                 }
             }
         }
@@ -900,6 +905,17 @@ extension BLEManager: CBPeripheralDelegate {
                            error: Error?) {
         if let error = error {
             log("Confirmed write failed: \(error.localizedDescription)")
+            // WHOOP 5/MG first connect: CoreBluetooth won't start a fresh just-works bond against a strap
+            // still bonded to the official WHOOP app, so the CLIENT_HELLO .withResponse write fails with
+            // "Encryption/Authentication is insufficient" and the link never authenticates. Surface
+            // actionable pairing-mode guidance instead of failing silently (issue #17).
+            if selectedModel.deviceFamily == .whoop5, !didBond {
+                let d = error.localizedDescription.lowercased()
+                if d.contains("encryption") || d.contains("authentication") {
+                    state.pairingHint = "Close the official WHOOP app (or turn its phone's Bluetooth off), put the strap in pairing mode — blue LEDs flashing — then reconnect."
+                    log("WHOOP 5/MG: bond refused — the strap is likely still paired to the WHOOP app. Put it in pairing mode (blue LEDs) with the WHOOP app closed, then reconnect.")
+                }
+            }
             return
         }
 
@@ -913,12 +929,21 @@ extension BLEManager: CBPeripheralDelegate {
             if !didBond {
                 didBond = true
                 state.bonded = true
-                log("WHOOP 5/MG: CLIENT_HELLO acked — link established; (re)subscribing notify chars (experimental).")
+                state.pairingHint = nil
+                log("WHOOP 5/MG: CLIENT_HELLO acked — link established; subscribing notify chars (experimental).")
             }
             for c in whoop5NotifyCharacteristics where !c.isNotifying {
                 requestNotify(c, on: peripheral, reason: "post-bond puffin")
             }
             enableLiveNotifications(reason: "post-bond 5/MG")   // standard HR/battery that failed pre-bond
+            // Arm realtime HR with puffin framing — the verified step that makes a bonded 5/MG strap start
+            // streaming (issue #17). Once per connection; keep-alive skips 5/MG, so this is the trigger.
+            // (Opening Live later also arms it via startRealtime(), now that send() routes the 5/MG toggle.)
+            if wantsRealtime && !whoop5RealtimeArmed {
+                whoop5RealtimeArmed = true
+                log("WHOOP 5/MG: arming realtime HR (puffin TOGGLE_REALTIME_HR)")
+                send(.toggleRealtimeHR, payload: [0x01])
+            }
             startKeepAlive()                                    // re-subscribe + liveness watchdog
             return
         }
