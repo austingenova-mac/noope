@@ -17,6 +17,25 @@ approximate; downloads are on the [Releases](https://github.com/NoopApp/noop/rel
 
 ---
 
+## 1.17 — Sleep from WHOOP 4 on unmapped firmware (Mac)
+
+- **Fixed (macOS): a WHOOP 4 on firmware whose historical record version NOOP hadn't mapped recorded no
+  sleep.** Root cause: sleep is staged from the strap's overnight **gravity/motion** stream
+  (`SleepStager.detectSleep` requires gravity — empty gravity → 0 sleeps). The WHOOP 4 historical
+  (type-47) post-hook **bailed out entirely on any version outside the schema's `{12, 24}`** —
+  `guard resolveVersion(...) else { region("unmapped"); return }` decoded nothing (no HR, no R-R, **no
+  gravity**). So the offload "completed" (acks + HISTORY_COMPLETE) yet stored no motion, HR got
+  backfilled from the realtime stream (which carries none), and `IntelligenceEngine` produced a day with
+  HR but zero sleeps. **Fix:** for an unmapped version, fall back to the canonical **v24 DSP layout**
+  (firmware overwhelmingly shares it — the schema notes V12 == V24) and accept it **only if it decodes
+  to physically-real data** — `|gravity| ≈ 1 g` (the DSP gravity is a unit vector) and a plausible HR. A
+  wrong layout yields random f32 gravity nowhere near 1 g, so it's rejected and the record left raw (the
+  Backfiller then logs the unmapped version once to the strap log, so we can map it). Mapped versions are
+  unchanged. New tests cover accept + reject. Issue #30. *(Android has its own decoder; this is the Mac
+  fix for the reporters' platform.)*
+
+---
+
 ## 1.16 — Health Connect shows as Health Connect (Android)
 
 - **Fixed (Android): Health Connect data was attributed to "Apple Health."** `HealthConnectImporter`

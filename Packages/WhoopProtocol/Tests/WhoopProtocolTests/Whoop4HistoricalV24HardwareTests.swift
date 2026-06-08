@@ -68,4 +68,36 @@ final class Whoop4HistoricalV24HardwareTests: XCTestCase {
         XCTAssertEqual(st.rr.map { $0.rrMs }, [555, 564])
         XCTAssertEqual(st.gravity.first?.unit, "g")
     }
+
+    // MARK: - Unmapped-firmware-version fallback (#30: no-sleep on unsupported firmware)
+
+    func testUnmappedVersionFallsBackToV24WhenPhysicallyValid() {
+        // The same real record, but with its version byte (frame[5]) relabeled to one the schema does
+        // NOT map (25). Because firmware versions overwhelmingly share the v24 DSP layout, the fallback
+        // should decode it via that layout — and accept it, since the result is physically valid
+        // (|gravity| ≈ 1 g, HR plausible). Without this, the record would yield no gravity → no sleep.
+        var f = bytes(realV24Hex)
+        f[5] = 25
+        let p = parseFrame(f).parsed
+        XCTAssertEqual(p["hist_version"]?.intValue, 25)
+        XCTAssertEqual(p["heart_rate"]?.intValue, 109)            // decoded via the v24 fallback
+        XCTAssertEqual(p["rr_intervals"]?.intArrayValue ?? [], [555, 564])
+        guard case .double(let gx)? = p["gravity_x"],
+              case .double(let gy)? = p["gravity_y"],
+              case .double(let gz)? = p["gravity_z"] else { return XCTFail("gravity must decode") }
+        XCTAssertEqual((gx * gx + gy * gy + gz * gz).squareRoot(), 1.0, accuracy: 0.1)
+    }
+
+    func testUnmappedVersionRejectedWhenV24LayoutDoesNotFit() {
+        // Unmapped version AND the v24 gravity offsets (40/44/48) wiped → |gravity| = 0, not ~1 g, so the
+        // v24 layout clearly doesn't fit this firmware. The fallback must REJECT it (store nothing
+        // garbage) while still surfacing the version, so the Backfiller can log it for manual mapping.
+        var f = bytes(realV24Hex)
+        f[5] = 25
+        for i in 40..<52 { f[i] = 0 }
+        let p = parseFrame(f).parsed
+        XCTAssertEqual(p["hist_version"]?.intValue, 25)          // version still surfaced (diagnostic)
+        XCTAssertNil(p["heart_rate"])                            // rejected → nothing decoded
+        XCTAssertNil(p["gravity_x"])
+    }
 }
