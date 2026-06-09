@@ -7,7 +7,14 @@ import Combine
 @MainActor
 public final class LiveState: ObservableObject {
     @Published public var connected: Bool = false
-    @Published public var bonded: Bool = false
+    @Published public var bonded: Bool = false {
+        didSet {
+            // The pairing hint only applies before the link bonds. Clear it on every bond-completion
+            // path so a transient handshake hiccup can't leave "Pairing refused" up on a working,
+            // bonded, streaming connection (issue #69 — bonded + live HR, yet the banner still showed).
+            if bonded { pairingHint = nil }
+        }
+    }
     @Published public var heartRate: Int? = nil
     @Published public var rr: [Int] = []
     @Published public var batteryPct: Double? = nil

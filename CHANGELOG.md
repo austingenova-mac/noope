@@ -17,6 +17,15 @@ approximate; downloads are on the [Releases](https://github.com/NoopApp/noop/rel
 
 ---
 
+## 1.44 — Fixes a false "pairing refused" warning (Mac, #69)
+
+- **The "Pairing refused" banner no longer cries wolf on a working connection** (Mac). It could stay
+  up on the Live screen even after the strap had bonded and live heart rate was streaming — a stale
+  warning on a link that was actually fine (reported by a 5.0/MG owner, #69). `LiveState.pairingHint`
+  now clears on every bond-completion path (a `didSet` on `bonded`), so it disappears the moment the
+  link bonds.
+- Android: **version bump only** (the banner is macOS-only).
+
 ## 1.43 — 24-hour heart-rate trend on the dashboard
 
 - **See your whole day's heart rate on Control Center** (Mac + Android). A new full-width trend plots
