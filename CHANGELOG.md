@@ -17,6 +17,15 @@ approximate; downloads are on the [Releases](https://github.com/NoopApp/noop/rel
 
 ---
 
+## 1.41 — Update check shows what's new
+
+- **The "Check for updates" result now previews what's new.** When a newer version is found, the
+  result expands to show the release's notes (the changes, with the Downloads/footer boilerplate
+  trimmed and the heaviest markdown stripped, capped + scrollable) alongside the Download button — so
+  you can see what you're getting before tapping through. The `body` is already in the
+  `releases/latest` response, so this is the same single request; `cleanNotes()` does the trimming on
+  each platform. No new network behaviour.
+
 ## 1.40 — Check for updates (both platforms)
 
 - **New: a manual "Check for updates" button** in Settings → About. One user-initiated GET to the
