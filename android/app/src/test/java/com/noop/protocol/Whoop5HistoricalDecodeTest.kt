@@ -50,6 +50,89 @@ class Whoop5HistoricalDecodeTest {
     }
 
     @Test
+    fun decodesV18ObservedFields() {
+        // Fields read off the same real worn frame, justified by observed behaviour (parity with the
+        // Swift Whoop5HistoricalTests.testHistoricalV18ObservedFields).
+        val p = decodeHistorical(bytes(wornV18), DeviceFamily.WHOOP5)!!
+        assertEquals(25443699, p["record_index"])               // @11 per-record counter
+        assertEquals(25997, p["hr_fixed_8_8"])                  // @36 value/256 ≈ HR (101.55 ≈ 102)
+        assertEquals(101, (p["hr_fixed_8_8"] as Int) / 256)
+        assertEquals(170, p["step_cadence"])                    // @59 cadence-like byte (raw)
+        assertEquals(1792, p["status_word"])                    // @75 not a deep-sleep marker
+        assertEquals(0, p["sleep_state"])                       // @81 worn daytime frame = wake
+        assertEquals(25444, p["rr_packed"])
+        assertEquals(0, p["cardiac_flags"])
+        assertEquals(255, p["cardiac_status"])
+        assertEquals(-5.2307, p["unknown_f32_113"] as Double, 0.001)  // @113 float, purpose unknown
+
+        // Newly-mapped adjacent fields (read off the same real worn frame).
+        assertEquals(247, p["temp_aux_1_raw"])  // @69 signed i16, °C = raw/10 ≈ 24.7
+        assertEquals(265, p["temp_aux_2_raw"])  // @71 signed i16, ≈ 26.5
+        assertEquals(3057, p["skin_temp_raw"])  // @73 raw u16, °C = raw/100 ≈ 30.57 (physiological)
+        assertEquals(3073, p["status_word_1"])  // @77 raw u16
+        assertEquals(3074, p["status_word_2"])  // @79 raw u16
+        assertEquals(0, p["wake_quality"])      // @81 bits 2-3
+        assertEquals(0, p["onwrist"])           // @81 bits 0-1 (worn daytime, low nibble 0)
+        assertEquals(0, p["aux_byte_82"])       // @82 raw byte
+    }
+
+    @Test
+    fun decodesV18AuxFieldsAcrossDevices() {
+        // The aux thermal pair, status words, on-wrist bit, and aux byte read consistently off the
+        // other real fixtures. The second-device HR57 frame has the @81 on-wrist bit set (low nibble 1).
+        val ack = decodeHistorical(bytes(androidAckCaptureV18), DeviceFamily.WHOOP5)!!
+        assertEquals(294, ack["temp_aux_1_raw"])
+        assertEquals(310, ack["temp_aux_2_raw"])
+        assertEquals(3073, ack["status_word_1"])
+        assertEquals(3074, ack["status_word_2"])
+        assertEquals(3238, ack["skin_temp_raw"]) // 32.38 °C with the /100 scale
+
+        val dev57 = decodeHistorical(bytes(secondDeviceHR57), DeviceFamily.WHOOP5)!!
+        assertEquals(1, dev57["onwrist"])         // @81 low nibble = 1 on this frame
+        assertEquals(0, dev57["wake_quality"])
+        assertEquals(0, dev57["sleep_state"])
+        assertEquals(2962, dev57["skin_temp_raw"]) // 29.62 °C
+    }
+
+    @Test
+    fun band81NibblesSplitIndependently() {
+        // @81 packs sleep_state (bits 4-5), wake_quality (bits 2-3) and onwrist (bits 0-1). Override the
+        // byte on the real fixture and re-stamp the CRC32 (over frame[8..len-4], per Framing) so it passes
+        // the gate, then check each sub-field is sliced independently.
+        data class Exp(val raw: Int, val sleep: Int, val wakeQ: Int, val onwrist: Int)
+        for (e in listOf(
+            Exp(0x00, 0, 0, 0),
+            Exp(0x39, 3, 2, 1),   // 0b00_11_10_01
+            Exp(0x16, 1, 1, 2),   // 0b00_01_01_10
+            Exp(0x2B, 2, 2, 3),   // 0b00_10_10_11
+        )) {
+            val f = bytes(wornV18); f[81] = e.raw.toByte()
+            val end = f.size - 4
+            val crc = Crc.crc32(f.copyOfRange(8, end))
+            f[end] = (crc and 0xFF).toByte(); f[end + 1] = ((crc shr 8) and 0xFF).toByte()
+            f[end + 2] = ((crc shr 16) and 0xFF).toByte(); f[end + 3] = ((crc shr 24) and 0xFF).toByte()
+            val p = decodeHistorical(f, DeviceFamily.WHOOP5)!!
+            assertEquals(e.sleep, p["sleep_state"])
+            assertEquals(e.wakeQ, p["wake_quality"])
+            assertEquals(e.onwrist, p["onwrist"])
+        }
+    }
+
+    @Test
+    fun sleepStateReadsHighNibbleOnly() {
+        // @81 high nibble = band sleep state; low nibble = sub-flags. Override that byte on the real
+        // fixture and re-stamp the CRC32 (over frame[8..len-4], per Framing) so it passes the gate.
+        for ((raw, expected) in listOf(0x00 to 0, 0x10 to 1, 0x20 to 2, 0x30 to 3, 0x25 to 2)) {
+            val f = bytes(wornV18); f[81] = raw.toByte()
+            val end = f.size - 4
+            val crc = Crc.crc32(f.copyOfRange(8, end))
+            f[end] = (crc and 0xFF).toByte(); f[end + 1] = ((crc shr 8) and 0xFF).toByte()
+            f[end + 2] = ((crc shr 16) and 0xFF).toByte(); f[end + 3] = ((crc shr 24) and 0xFF).toByte()
+            assertEquals(expected, decodeHistorical(f, DeviceFamily.WHOOP5)!!["sleep_state"])
+        }
+    }
+
+    @Test
     fun skinTempTracksWristContact() {
         val worn = decodeHistorical(bytes(wornV18), DeviceFamily.WHOOP5)!!
         val off = decodeHistorical(bytes(offWristV18), DeviceFamily.WHOOP5)!!

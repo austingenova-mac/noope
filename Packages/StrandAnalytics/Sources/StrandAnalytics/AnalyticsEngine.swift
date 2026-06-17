@@ -172,6 +172,12 @@ public enum AnalyticsEngine {
                                   // false-sleep guard (#90). Default 0 keeps pure-function callers/tests
                                   // on UTC; IntelligenceEngine passes the device's real offset.
                                   tzOffsetSeconds: Int = 0,
+                                  // WRIST_OFF event timestamps (unix seconds) for the off-wrist sleep
+                                  // backstop (#500). The HR-gap proxy in detectSleep is the primary
+                                  // guard; these explicit events are a bonus drop. Default empty keeps
+                                  // pure-function callers/tests event-free; IntelligenceEngine passes
+                                  // the night window's WRIST_OFF events.
+                                  wristOff: [Int] = [],
                                   // Rest composite (Charge/Effort/Rest) personalization. Both default to
                                   // their neutral form so pure-function callers/tests get a well-defined
                                   // Rest from a single night; IntelligenceEngine refines them from history.
@@ -185,7 +191,7 @@ public enum AnalyticsEngine {
 
         // ── Sleep detection + staging ─────────────────────────────────────────
         let allSessions = SleepStager.detectSleep(hr: hr, rr: rr, resp: resp, gravity: gravity,
-                                                  tzOffsetSeconds: tzOffsetSeconds)
+                                                  tzOffsetSeconds: tzOffsetSeconds, wristOff: wristOff)
         // Sessions attributed to `day` = those whose end falls on `day` (LOCAL day, #277). `day` is
         // the caller's local-day key; attribute by the same offset so the bucket and the key agree.
         let matched = allSessions.filter { dayString($0.end, offsetSec: tzOffsetSeconds) == day }

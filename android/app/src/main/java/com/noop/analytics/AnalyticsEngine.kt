@@ -140,6 +140,11 @@ object AnalyticsEngine {
         // Default 0 keeps pure-function callers/tests on UTC; IntelligenceEngine passes the device's
         // real offset.
         tzOffsetSeconds: Long = 0L,
+        // WRIST_OFF event timestamps (unix seconds) for the off-wrist sleep backstop (#500). The
+        // HR-gap proxy in detectSleep is the primary guard; these explicit events are a bonus drop.
+        // Default empty keeps pure-function callers/tests event-free; IntelligenceEngine passes the
+        // night window's WRIST_OFF events.
+        wristOff: List<Long> = emptyList(),
         // Personal sleep need (hours) for the Rest "duration vs need" component. null → 8 h default.
         // IntelligenceEngine refines it from the user's recent average asleep hours. (Charge/Effort/Rest)
         sleepNeedHours: Double? = null,
@@ -155,6 +160,7 @@ object AnalyticsEngine {
         // ── Sleep detection + staging ─────────────────────────────────────────
         val allSessions = SleepStager.detectSleep(
             hr = hr, rr = rr, resp = resp, gravity = gravity, tzOffsetSeconds = tzOffsetSeconds,
+            wristOff = wristOff,
         )
         // Sessions attributed to `day` = those whose end falls on `day` (LOCAL day, #277). `day` is
         // the caller's local-day key; attribute by the same offset so the bucket and the key agree.

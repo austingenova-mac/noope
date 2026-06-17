@@ -200,7 +200,7 @@ final class SourceCoordinator: ObservableObject {
             live: live,
             deviceId: id,
             persist: { [storeHandle] streams in
-                Task { if let store = await storeHandle() { try? await store.insert(streams, deviceId: id) } }
+                Task { if let store = await storeHandle() { _ = try? await store.insert(streams, deviceId: id) } }
             },
             log: straplog)   // generic-HR lifecycle → the SAME exported strap log (issue #421)
         // CONNECT to the active strap's known peripheral, don't just scan. scan() only discovered + listed

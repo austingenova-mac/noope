@@ -228,10 +228,17 @@ object IntelligenceEngine {
         for (offset in 0 until maxDays) {
             val dayStart = nowLocalMidnight - offset * SECONDS_PER_DAY
             val day = AnalyticsEngine.dayString(dayStart, tzOffsetSeconds)
-            // Read a generous window around the night that ends on `day`; the stager finds
-            // the span. (30 h before, 18 h after (6 PM) — matches the Swift window.)
+            // Read a generous window around the night that ends on `day`; the stager finds the span.
             val from = dayStart - 30 * 3_600L
-            val to = dayStart + 18 * 3_600L
+            // Sleep read-window END. For a PAST day the night may end any time before the NEXT local
+            // midnight (late sleepers / weekend lie-ins / shift workers wake well after noon), so a
+            // hard `dayStart + 18h` (6 PM) bound TRUNCATED the read at exactly 18:00 — and a real wake
+            // past it was reported as a flat 18:00 wake (#500). Read a PAST day through to the next
+            // local midnight so the stager sees the whole night; TODAY keeps the 18:00 cap (the DAO
+            // clamps to now anyway, and an in-progress nap shouldn't be read as a finished night).
+            // Matches the Swift window.
+            val nextMidnight = dayStart + SECONDS_PER_DAY
+            val to = if (dayStart < nowLocalMidnight) nextMidnight else dayStart + 18 * 3_600L
 
             // I2: pick the single device that OWNS this day, and read ITS streams below. With one device
             // this resolves to [importedDeviceId] (active strap, has data → priority 0), so nothing
@@ -247,6 +254,11 @@ object IntelligenceEngine {
             val grav = repo.gravitySamples(owner, from, to, STREAM_LIMIT)
             val steps = repo.stepSamples(owner, from, to, STREAM_LIMIT)
             val skin = repo.skinTempSamples(owner, from, to, STREAM_LIMIT)
+            // WRIST_OFF events in the night window for the off-wrist sleep backstop (#500). The HR-gap
+            // proxy in the stager is the primary guard; these explicit events are a bonus drop of any
+            // run that overlaps one. kind is the strap event label, e.g. "WRIST_OFF(10)".
+            val wristOff = repo.events(owner, from, to, STREAM_LIMIT)
+                .filter { it.kind.startsWith("WRIST_OFF") }.map { it.ts }
 
             // Calendar-day window for the ADDITIVE daily totals (steps + calories). The night window
             // above is anchored to the current time-of-day and ends at dayStart+12h, so for a PAST
@@ -284,6 +296,7 @@ object IntelligenceEngine {
                 baselines = baselines1,
                 maxHROverride = maxHROverride,
                 tzOffsetSeconds = tzOffsetSeconds,
+                wristOff = wristOff,
             )
 
             // Harvest the baseline-independent nightly aggregates (a day with no detected

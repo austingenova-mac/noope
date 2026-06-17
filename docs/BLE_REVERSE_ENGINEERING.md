@@ -423,12 +423,28 @@ garbage (HR `0`, gravity overflow). The fields below were read off real frames a
 | Offset | Field | Validation |
 |---|---|---|
 | 9 | `hist_version` (u8) = 18 | discriminates the layout |
+| 11 | `record_index` (u32 LE) | a per-record counter: `+1` every record and **independent of `unix`** (it advances across gaps), so a lifetime record index, not a clock. Span ≈ record count on **two** straps. `@11` is only the low byte — read the full `u32` LE. |
 | 15 | `unix` (u32) | monotonic, +1 s |
 | 22 | `heart_rate` (u8) | **matched the 2A37-verified live HR exactly at all 96 overlapping timestamps** (mean \|Δ\| 0.00 bpm); note this is v24's `21`+1, **not** +4 |
 | 23 | `rr_count` (u8) | matches #valid R-R intervals 100 % (1141/1143) |
 | 24 + 2·i | `rr[i]` (u16, ms) | 60000/mean(R-R) ≈ HR for 88 % (rest are HR-averaging) |
+| 36 | `hr_fixed_8_8` (u16 LE) — bpm = `value/256` | a **higher-precision heart rate**: `value/256` correlates **0.989** with the integer `heart_rate@22` over ~258k records and carries sub-bpm fractions `@22` can't (e.g. `25997` → 101.55 bpm vs `@22`=102). |
+| 33 / 38 / 40 | raw bytes near the HR / R-R fields | carried **raw** (meaning not pinned from observation): `@33` a flag-ish byte, `@38` a u16 beside the R-R fields, `@40` a status-like byte. |
 | 45 / 49 / 53 | `gravity_x/y/z` (f32, g) | \|g\| ≈ 1.0 for 100 % of 500 records; v18 has **one** triplet (not v24's two) |
-| 73 | `skin_temp_raw` (u16); °C = raw / 128 | A **digital skin-temperature sensor**; the `/128` scale (≈7.8125 m°C/LSB) matches its observed resolution. Identified **purely from the data**: the on-wrist **warming curve 17.5 → 28 °C** as it equilibrates after donning is a thermal signature nothing else in the record has. Stored **raw** (scale-agnostic; the absolute `/128` vs `/100` reading awaits a contact-thermometer). Decoded in `decodeWhoop5Historical` (`Interpreter.swift`); flows to the decode-features store as `skin_temp_raw` + derived `skin_temp_c`. |
+| 57–58 | `step_motion_counter` (u16 LE @[57:59]) | a **cumulative** counter: climbs while moving, flat when still, low byte wraps at 256. **Steps = Σ wrap-aware diffs** `(cur-prev)&0xFFFF` — *not* the value summed per record (that over-counts massively — the WHOOP 5/MG step over-report). No per-record step count is in the record. |
+| 59 | `step_cadence` (u8) | a **cadence-like** byte between the counter and `@63`: never `0`, and lower when moving faster (still > walk > run in the data). Raw — no unit asserted. |
+| 63 | `motion_wear_quality` (u8) {0,1,2} | a 3-valued byte; kept **raw** (semantics not pinned from observation). |
+| 69 | `temp_aux_1_raw` (i16 LE); °C = value/10 | a **secondary temperature channel**: tracks `skin_temp@73` (corr **0.92** on two straps) with the same on-wrist diurnal curve; deci-°C resolution. |
+| 71 | `temp_aux_2_raw` (i16 LE); °C = value/10 | a second **temperature channel**: tracks `skin_temp@73` (corr **0.97**), same diurnal behaviour. |
+| 73 | `skin_temp_raw` (u16); °C = raw / 100 | A **digital skin-temperature sensor**, identified **purely from the data**: the on-wrist warming/diurnal curve is a thermal signature nothing else in the record has. **Scale = `/100`** — the only divisor that yields a physiological worn skin temperature (median ≈ **34 °C** across two straps; `/128` reads a non-physiological ≈ 27 °C). Decoded in `decodeWhoop5Historical` (`Interpreter.swift`); flows to the decode-features store as `skin_temp_raw` + derived `skin_temp_c`. |
+| 75 | `status_word` (u16 LE) | a packed status word; **NOT a deep-sleep marker** — its low nibble is `0` across ~258k records and it occurs as often awake as asleep (the community "`80`=deep" reading is a misread). Raw. |
+| 77 | `status_word_1` (u16 LE) | raw; a near-static sibling of `status_word@75` (low nibble = channel index `1`). |
+| 79 | `status_word_2` (u16 LE) | raw; sibling of `@75`/`@77` (low nibble = `2`). |
+| 81 | `sleep_state` = `(byte >> 4) & 3` (+ low-nibble sub-flags) | bits 4-5 = the band sleep state: `0` wake / `1` still / `2` asleep / `3` up (deep/REM/light are off-band). Low-nibble sub-flags, observation-framed: **b0-1 `onwrist`** (on-wrist/validity flag) and **b2-3 `wake_quality`** (a 2-bit code observed nonzero **only in wake**); **b6-7 reserved** (`0` across all records). (Hypothesised from captures + a scored night on #132.) |
+| 82 | `aux_byte_82` (u8) | raw; observed **nonzero only while `sleep_state` = asleep** (meaning not pinned from observation). |
+| 83–103 | reserved | observed **constant `0`** on two straps (zero-filled). |
+| 104 | (const) | observed **constant `1`** on two straps; carried raw, no metric. |
+| 113 | `unknown_f32_113` (f32 LE) | a float32 (observed range ~ −5.3…0, `0` = unset); **purpose unknown**, carried raw. |
 
 The strongest check on the HR offset: where a historical record and a live `REALTIME_DATA` (§5, 2A37
 ground-truth-verified) frame share a timestamp, the historical HR equalled the live HR at **96/96**
@@ -492,6 +508,42 @@ The full v26 byte map (88 bytes; CRC32 @84):
 samples are raw AC-coupled ADC counts — PPG has no absolute unit — so no scale is invented; the
 high-entropy `23–26` and the footer are left raw (no internal ground truth). Reproduce the proof with
 `tools/linux-capture/analyze_v26_waveform.py`; parity tests `Whoop5PpgWaveformTests.swift`.
+
+### The WHOOP 5.0 / MG type-47 records (versions 20 & 21) — bulk multi-channel sensor stream
+
+Newer 5/MG firmware also serves two **large** type-47 records alongside v18/v26: **version 20 (2140 B)**
+and **version 21 (1244 B)**, emitted as a **pair per second**. Older builds had no map for them, fell back
+to "unmapped layout", and stored nothing — so the offload completed but no data landed (issue #344). Both
+reuse the v18 record header, confirmed across the captured frames:
+
+| Offset | Field | Notes |
+|---|---|---|
+| 9 | layout version | 20 (len 2140) / 21 (len 1244) |
+| 10 | `layout_marker` (u8) | `0x81` (v20) / `0x80` (v21), constant per version |
+| 11 | `record_index` (u32 LE) | monotonic +1/record — the same lifetime counter as v18 |
+| 15 | `unix` (u32 LE) | real seconds, +1 s/record (v18's slot) |
+
+Integrity is the standard trailing **CRC32** over the payload (`frame[8 : len-4]`) — it validates on every
+captured frame of both versions, which is what lets the body offsets be trusted.
+
+The bodies are blocks of fixed-length **sample channels**:
+
+- **v21 (1244 B):** a `(100, 100, 3)` descriptor near `@22`, then **three 100-sample i16 channels at
+  `@28` / `@228` / `@428`** (200 B apart). Each is a bounded pulsatile waveform at its own DC baseline
+  (≈1820 / 720 / 3630) — the signature of optical (PPG) channels.
+- **v20 (2140 B):** **five channel blocks**, each preceded by a **presence byte** (`0x19` = active,
+  `0x00` = empty/zero-filled). An active block holds **two 50-sample i32 channels**. Presence bytes at
+  `@0x1a / 0x1c0 / 0x366 / 0x50c / 0x6b2`; the ten channel slots start at
+  `@0x2f / 0xf7 / 0x1d5 / 0x29d / 0x37b / 0x443 / 0x521 / 0x5e9 / 0x6c7 / 0x78f`. i32 LE is the correct
+  width (only that alignment yields smooth waveforms; an empty block's 200-byte slots are all-zero across
+  every frame, matching its `0x00` presence byte). So v20 carries the same sensor set as v21 at i32 /
+  50-sample resolution.
+
+`decodeWhoop5HistoricalV2021` exposes `layout_marker`, `record_index`, `unix`, and the active channels as
+**raw sample arrays with no invented scale** (an optical waveform has no absolute unit). Which channel is
+which optical LED — and which carries motion/accelerometer — is **not** determinable from a stationary
+capture and needs a **labelled (e.g. deliberately moving) window**, so no per-channel identity is asserted.
+Tests: `Whoop5HistoricalV2021Tests.swift`.
 
 > The v18 per-second record's own optical region (bytes [57:120]) carries **no simple summary of this
 > PPG** (no field tracks its DC or AC amplitude), and its SpO₂ / skin-temp channels have no internal

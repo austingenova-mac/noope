@@ -232,8 +232,10 @@ fun decodeHistorical(frame: ByteArray, family: DeviceFamily = DeviceFamily.WHOOP
  * byte 8 (type@8, version@9) and fields sit at their WHOOP5-ABSOLUTE offsets — NOT the WHOOP4 V24 layout
  * shifted by +4 (that decodes to garbage on v18). Offsets verified against real worn/off-wrist frames
  * (the data is the arbiter): unix@15, hr@22, rr@24+, gravity@45/49/53, and per-second fields each gated
- * to a physical range so a wrong offset on unmapped firmware stores nothing. Mirrors Swift
- * `decodeWhoop5Historical`, and emits the same keys [extractHistoricalStreams] reads. v26 (PPG) and other
+ * to a physical range so a wrong offset on unmapped firmware stores nothing; further fields (aux thermal
+ * @69/71, status words @75/77/79, the @81 band-flag nibbles, aux byte @82) are read off the same real
+ * frames. Mirrors Swift `decodeWhoop5Historical`, and emits the same keys [extractHistoricalStreams] reads.
+ * v26 (PPG) and other
  * versions aren't stored, so they return null here (skipped), matching the Swift raw-region treatment.
  */
 private fun decodeWhoop5Historical(frame: ByteArray): Map<String, Any?>? {
@@ -243,6 +245,9 @@ private fun decodeWhoop5Historical(frame: ByteArray): Map<String, Any?>? {
 
     val out = LinkedHashMap<String, Any?>()
     out["hist_version"] = version
+    // @11 a per-record counter: +1 every record, independent of unix (advances across gaps); seen on
+    // two straps. @11 is only the low byte — read the full u32 LE.
+    frame.histU32(11)?.let { out["record_index"] = it.toInt() }
     frame.histU32(15)?.let { out["unix"] = it.toInt() }
     frame.histU8(22)?.let { out["heart_rate"] = it }
     val rrn = frame.histU8(23) ?: 0
@@ -253,22 +258,51 @@ private fun decodeWhoop5Historical(frame: ByteArray): Map<String, Any?>? {
         if (v != null && v != 0) rrVals.add(v)
     }
     out["rr_intervals"] = rrVals
+    // Bytes adjacent to the HR/R-R fields. @36/256 tracks hr@22 to sub-bpm (corr 0.989) — a
+    // higher-precision heart rate; the others are carried raw (meaning not pinned).
+    frame.histU8(33)?.let { out["cardiac_flags"] = it }
+    frame.histU16(36)?.let { out["hr_fixed_8_8"] = it }   // bpm = value / 256
+    frame.histU16(38)?.let { out["rr_packed"] = it }
+    frame.histU8(40)?.let { out["cardiac_status"] = it }
     frame.histF32(45)?.let { out["gravity_x"] = it }
     frame.histF32(49)?.let { out["gravity_y"] = it }
     frame.histF32(53)?.let { out["gravity_z"] = it }
 
     // Per-second fields beyond HR/gravity, each gated to a physically-real range (cross-validated
-    // worn vs off-wrist). Fields the source report listed but that didn't decode consistently on this
-    // firmware (cardiac_flags@33, sleep-state@81, perfusion@69/71) are deliberately not decoded.
+    // worn vs off-wrist). Optical/perfusion @69/71 still doesn't decode consistently and is left raw.
     frame.histF32(41)?.let { if (it.isFinite() && it in 0.0..8.0) out["dynamic_acceleration"] = it }
     frame.histU16(57)?.let { out["step_motion_counter"] = it }
+    // @59 a per-step cadence-like byte (never 0; lower when moving faster). Raw — no unit asserted.
+    frame.histU8(59)?.let { out["step_cadence"] = it }
     frame.histU8(63)?.let { if (it in 0..2) out["motion_wear_quality"] = it }
-    // skin temp: raw u16 (the store keeps it raw, /100 at display). Gate on a plausible thermal
-    // range using the SAME scale-agnostic predicate as Swift (Interpreter.swift:350-351): raw/128 in
-    // 5…45 °C. A tighter /100·20…45 band silently dropped valid early-donning samples (the 17.5 °C
-    // on-wrist warming curve) that Mac/iOS keep — the gate is only a garbage filter, the absolute
-    // scale lives in the consumer, so this keeps the three platforms' stored set identical. (Parity.)
-    frame.histU16(73)?.let { if ((it / 128.0) in 5.0..45.0) out["skin_temp_raw"] = it }
+    // Auxiliary thermal readings adjacent to the main skin-temperature register, read off a digital
+    // skin-temperature sensor. Carried raw; °C = raw/10. Signed i16, gated to a plausible thermal range
+    // so a wrong offset on an unmapped layout stores nothing rather than garbage.
+    frame.histI16(69)?.let { if ((it / 10.0) in 0.0..60.0) out["temp_aux_1_raw"] = it }
+    frame.histI16(71)?.let { if ((it / 10.0) in 0.0..60.0) out["temp_aux_2_raw"] = it }
+    // skin temp: raw u16 (the store keeps it raw, /100 at display). Gate on a plausible thermal range:
+    // °C = raw/100 — gives physiological worn temperatures (median ~34 °C across two straps), whereas a
+    // /128 reading lands at a non-physiological ~27 °C. The gate is only a garbage filter; the absolute
+    // scale lives in the consumer.
+    frame.histU16(73)?.let { if ((it / 100.0) in 5.0..45.0) out["skin_temp_raw"] = it }
+    // @75 a 16-bit status word; NOT a deep-sleep marker (low nibble 0 across observed records, equal
+    // awake/asleep — the "80=deep" reading is a misread).
+    frame.histU16(75)?.let { out["status_word"] = it }
+    // @77 / @79 two further 16-bit status words adjacent to @75; carried raw, meaning not pinned.
+    frame.histU16(77)?.let { out["status_word_1"] = it }
+    frame.histU16(79)?.let { out["status_word_2"] = it }
+    // @81 packs several band flags into one byte. High nibble (bits 4-5) tracks a scored night:
+    // 0 wake / 1 still / 2 asleep / 3 up. bits 2-3 a wake-quality field; bits 0-1 an on-wrist flag.
+    // Deep/REM/light are computed off-band, not here.
+    frame.histU8(81)?.let {
+        out["sleep_state"] = (it shr 4) and 3
+        out["wake_quality"] = (it shr 2) and 3
+        out["onwrist"] = it and 3
+    }
+    // @82 a single raw byte adjacent to the flag byte; carried raw, meaning not pinned.
+    frame.histU8(82)?.let { out["aux_byte_82"] = it }
+    // @113 a float32 (observed range ~ -5.3..0, 0 = unset); purpose unknown, carried raw.
+    frame.histF32(113)?.let { if (it.isFinite()) out["unknown_f32_113"] = it }
     return out
 }
 

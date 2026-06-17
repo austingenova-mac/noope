@@ -21,6 +21,24 @@ final class ManualWorkoutRescoreTests: XCTestCase {
         XCTAssertNotNil(s?.strain)
     }
 
+    /// #499 — Avg HR is the TRUE arithmetic mean of the actual HR trace, not a zone-weighted or partial
+    /// estimate. This is the property that keeps the displayed average consistent with the graph / zones
+    /// / effort (all of which read the same per-second samples). A varied trace (so a zone-weighted or
+    /// truncated average would give a different answer) must still come out as the plain mean.
+    func testAvgHrIsTrueMeanOfVariedTrace() {
+        // Asymmetric ramp: 60 s climbing 100→159 then 60 s at 180. Plain mean ≠ midpoint, ≠ peak, ≠ any
+        // zone-weighted figure — only the arithmetic mean of every sample is correct.
+        let climb = (0..<60).map { HRSample(ts: 1_000 + $0, bpm: 100 + $0) }   // 100,101,…,159
+        let hold  = (0..<60).map { HRSample(ts: 1_060 + $0, bpm: 180) }         // 180 ×60
+        let samples = climb + hold
+        let expectedMean = Int((Double(samples.map(\.bpm).reduce(0, +)) / Double(samples.count)).rounded())
+        let s = ManualWorkoutRescore.scored(windowSamples: samples, profile: profile, hrMax: 190)
+        XCTAssertEqual(s?.avgHr, expectedMean)          // == mean of the trace (154.75 → 155)
+        XCTAssertEqual(s?.maxHr, 180)                   // == true peak of the trace
+        XCTAssertNotEqual(s?.avgHr, 180)                // NOT the peak
+        XCTAssertNotEqual(s?.avgHr, (100 + 180) / 2)    // NOT the min/max midpoint
+    }
+
     /// Too few samples → nil (nothing better than what we had; never fabricate from one reading).
     func testTooFewSamplesReturnsNil() {
         XCTAssertNil(ManualWorkoutRescore.scored(windowSamples: [HRSample(ts: 1, bpm: 130)],

@@ -763,8 +763,55 @@ final class Repository: ObservableObject {
         // Imported lifting sessions (Hevy / Liftosaur) live under their own "lifting" source.
         rows += (try? await store.workouts(deviceId: "lifting", from: lo, to: hi, limit: 5000)) ?? []
         let spans = WorkoutSource.parseDismissedSpans(dismissedDetectedSpans)
-        return rows.filter { !WorkoutSource.isDismissed($0, spans: spans) }
+        let visible = rows.filter { !WorkoutSource.isDismissed($0, spans: spans) }
             .sorted { $0.startTs > $1.startTs }
+        return await reconcileWorkoutHrWithTrace(visible, store: store)
+    }
+
+    /// DISPLAY-ONLY: reconcile each workout's shown Avg/Max HR with the strap trace that actually drives
+    /// its graph / zones / effort (#77, #499). The detail screen always charts (`workoutHrBuckets`) and
+    /// zone-bins (`workoutZoneMinutes`) the strap's own ~1 Hz samples over `[startTs, endTs]`; the
+    /// displayed Avg HR comes from the stored `avgHr`. Those can DIVERGE — a hand-edited Avg (128→139)
+    /// changes the number but not the trace, so the average no longer matches the graph/zones/effort
+    /// (#499). Here the stored field defers to the trace whenever the trace is present:
+    ///
+    ///  - STRAP-NATIVE rows (`manual` / detected `<id>-noop`) are charted/zoned/scored straight from this
+    ///    strap trace, so their Avg HR is ALWAYS recomputed as the true mean of those samples (and Max →
+    ///    true peak) — a manual edit can no longer drift them out of agreement with the graph.
+    ///  - IMPORTED rows (Apple Health / Health Connect / Whoop CSV) carry their OWN avg/max; we only FILL
+    ///    them when nil (and the strap happened to be worn), never overriding a real imported value.
+    ///
+    /// Requires `minSamples` (~1 min) so stray samples can't fabricate an average, and caps the per-row
+    /// HR reads so a huge history can't jank first paint. NEVER persisted — a read-time projection of the
+    /// trace (the workout PK upsert would wipe it anyway), recomputed on every load so display == graph
+    /// == zones == effort by construction. Kotlin twin: `WhoopRepository.fillWorkoutHrFromStrap`.
+    private func reconcileWorkoutHrWithTrace(_ rows: [WorkoutRow], store: WhoopStore,
+                                             minSamples: Int = 60, cap: Int = 300) async -> [WorkoutRow] {
+        var budget = cap
+        var out: [WorkoutRow] = []
+        out.reserveCapacity(rows.count)
+        for row in rows {
+            let cls = WorkoutSource.classify(row.source)
+            let strapNative = cls == .manual || cls == .detected
+            guard row.endTs > row.startTs, budget > 0, strapNative || row.avgHr == nil else {
+                out.append(row); continue
+            }
+            budget -= 1
+            // The very samples the graph + zones + effort use (strap deviceId, COALESCEd PPG fallback).
+            let samples = (try? await store.hrSamples(deviceId: deviceId,
+                                                      from: row.startTs, to: row.endTs, limit: 8000)) ?? []
+            guard samples.count >= minSamples else { out.append(row); continue }
+            let bpms = samples.map(\.bpm)
+            let avg = Int((Double(bpms.reduce(0, +)) / Double(bpms.count)).rounded())
+            let peak = bpms.max() ?? row.maxHr ?? 0
+            // Strap-native → trace IS the source: override avg + max. Imported → fill avg, keep imported max.
+            let newMax = strapNative ? peak : (row.maxHr ?? peak)
+            out.append(WorkoutRow(startTs: row.startTs, endTs: row.endTs, sport: row.sport,
+                                  source: row.source, durationS: row.durationS, energyKcal: row.energyKcal,
+                                  avgHr: avg, maxHr: newMax, strain: row.strain, distanceM: row.distanceM,
+                                  zonesJSON: row.zonesJSON, notes: row.notes))
+        }
+        return out
     }
 
     // MARK: - Workout editing (manual add/edit · relabel · dismiss · delete)

@@ -116,6 +116,23 @@ public enum SleepStager {
     /// Consecutive sleep epochs required to declare onset.
     public static let onsetPersistEpochs: Int = 3
 
+    // MARK: - Off-wrist backstop (#500)
+
+    // A wrist-OFF stretch reads as perfectly still gravity with no contrary motion, so the
+    // gravity spine classifies it as sleep — and because the off-wrist epochs carry zero/missing
+    // HR the daytime guard treats them as "missing data" and lets them through (a daytime desk-off
+    // strap logged a phantom sleep). The backstop is HR-COVERAGE: while the strap is worn it emits
+    // ~1 Hz HR, so a long CONTIGUOUS gap in the HR samples spanning a candidate sleep run is a
+    // strong off-wrist proxy that works even when explicit WRIST_OFF events are absent. A run with
+    // such a gap is NOT classified as sleep. This is independent of the daytime band — an off-wrist
+    // stretch is rejected day OR night, and a night-tail continuation does NOT exempt it.
+    /// A contiguous HR-sample gap longer than this (minutes), anywhere inside a candidate sleep run,
+    /// marks the run off-wrist and rejects it. Sized at maxGapMin so a real worn night (dense ~1 Hz
+    /// HR, or PPG-derived HR on a 5/MG) never trips it, but a wrist-off stretch (HR flatlines to no
+    /// samples) does. The edges of the run count too: a run that begins/ends far from its nearest HR
+    /// sample is partially uncovered.
+    public static let offWristHRGapMin: Int = 20
+
     // MARK: - Sparse-gravity robustness (#308)
 
     // On an un-unlocked WHOOP 5.0 the strap backfills mostly v18/v26 records where gravity is
@@ -449,6 +466,37 @@ public enum SleepStager {
         return Double(resting) <= baseline * daytimeRestingHRMult
     }
 
+    /// Off-wrist backstop (#500). True when the candidate run [p.start, p.end] has a contiguous gap
+    /// in its HR coverage longer than `offWristHRGapMin` minutes — a strong wrist-OFF proxy. Worn,
+    /// the strap streams ~1 Hz HR (or PPG-derived HR on a 5/MG), so a real night has no such gap; an
+    /// off-wrist stretch flatlines to no HR samples and trips it. The gaps from `p.start` to the first
+    /// in-run sample and from the last in-run sample to `p.end` are counted too, so a run mostly
+    /// outside HR coverage is also caught. With NO HR data at all (no stream) this returns false (the
+    /// gravity-only path is left to the existing guards — we can't assert off-wrist without HR).
+    static func hasOffWristHRGap(_ p: Period, hr: [HRSample]) -> Bool {
+        if hr.isEmpty { return false }
+        let gapS = offWristHRGapMin * 60
+        let seg = hr.filter { $0.ts >= p.start && $0.ts <= p.end }.sorted { $0.ts < $1.ts }
+        // No HR anywhere inside a run long enough to matter → fully uncovered → off-wrist.
+        if seg.isEmpty { return (p.end - p.start) > gapS }
+        // Leading edge: run start to first sample.
+        if seg[0].ts - p.start > gapS { return true }
+        // Interior: any gap between consecutive in-run samples.
+        for i in 1..<seg.count where seg[i].ts - seg[i - 1].ts > gapS { return true }
+        // Trailing edge: last sample to run end.
+        if p.end - seg[seg.count - 1].ts > gapS { return true }
+        return false
+    }
+
+    /// Off-wrist backstop (#500), event path. True when any explicit WRIST_OFF event timestamp falls
+    /// inside the candidate run [p.start, p.end]. A bonus to the HR-gap proxy: when the store surfaces
+    /// WRIST_OFF events (kind='WRIST_OFF(10)') the call site passes their timestamps and a run
+    /// overlapping one is dropped outright. Empty when no events are available (the default), so the
+    /// pure function and its tests are unaffected.
+    static func overlapsWristOff(_ p: Period, wristOff: [Int]) -> Bool {
+        wristOff.contains { $0 >= p.start && $0 <= p.end }
+    }
+
     // MARK: - detectSleep (public)
 
     /// Detect sleep sessions from biometric streams. Empty/absent gravity → [].
@@ -458,11 +506,16 @@ public enum SleepStager {
     /// used ONLY to place each window's center on a LOCAL clock for the daytime
     /// false-sleep guard (#90). It defaults to 0 so the pure function and its tests stay
     /// UTC; the live call site (IntelligenceEngine) passes the device's real offset.
+    /// `wristOff` is an optional list of WRIST_OFF event timestamps (unix seconds). When the call
+    /// site has them (IntelligenceEngine reads `store.events` kind='WRIST_OFF(10)'), any candidate
+    /// sleep run overlapping one is dropped — a bonus to the always-on HR-gap off-wrist backstop
+    /// (#500). Defaults to empty so the pure function and its tests stay event-free.
     public static func detectSleep(hr: [HRSample] = [],
                                    rr: [RRInterval] = [],
                                    resp: [RespSample] = [],
                                    gravity: [GravitySample],
-                                   tzOffsetSeconds: Int = 0) -> [SleepSession] {
+                                   tzOffsetSeconds: Int = 0,
+                                   wristOff: [Int] = []) -> [SleepSession] {
         let grav = gravity.sorted { $0.ts < $1.ts }
         if grav.count < 2 { return [] }
 
@@ -501,6 +554,13 @@ public enum SleepStager {
             if p.stage != "sleep" { continue }
             if (p.end - p.start) <= minSleepS { continue }
             if !confirmSleepWithHR(p, hr: hrS, baseline: baseline) { continue }
+            // Off-wrist backstop (#500): a wrist-OFF stretch is still gravity with no HR, so it slips
+            // past both the gravity spine and the daytime guard's "missing data" path. Reject any run
+            // with a long contiguous HR-coverage gap (the must-have proxy), OR — when WRIST_OFF events
+            // are available — any run overlapping one. This is deliberately checked BEFORE the
+            // night-tail exemption: an off-wrist stretch is off-wrist day or night, and it must NOT
+            // ride a continuation chain. It does NOT re-anchor the chain (the run is simply skipped).
+            if hasOffWristHRGap(p, hr: hrS) || overlapsWristOff(p, wristOff: wristOff) { continue }
             // Daytime false-sleep guard (#90): a window centered in the local daytime band
             // must clear a stricter bar (≥daytimeMinSleepMin AND a real resting-HR dip).
             // Overnight windows skip this entirely. restingHR is computed here (reused below).

@@ -57,14 +57,18 @@ final class Whoop5HistoricalTests: XCTestCase {
 
     func testHistoricalV18BiometricFields() {
         // The cross-validated per-second fields beyond HR/gravity, each gated to a physical range and
-        // verified against this real worn frame. (Fields that did NOT decode consistently on this
-        // firmware — cardiac_flags@33, state@81, perfusion@69/71 — are deliberately not decoded.)
+        // verified against this real worn frame. (Optical/perfusion @69/71 still doesn't decode
+        // consistently and is left in the raw region.)
         let p = parseFrame(bytes(historicalHex), family: .whoop5).parsed
-        // skin temperature: raw u16, stored by the firmware in CENTIDEGREES — °C = raw / 100. This very
-        // fixture is the proof: worn 3057 / off-wrist 2247 are 30.6 °C skin and 22.5 °C room ambient under
-        // /100 (physically right on both ends) but an impossible 23.9 °C "skin" under the AS6221-native
-        // /128 once assumed here. Raw kept in the record; consumers divide by 100 (matches Android).
+        // skin temperature: raw u16 register, °C = raw / 100. This very fixture is the proof: worn 3057 /
+        // off-wrist 2247 are 30.6 °C skin and 22.5 °C room ambient under /100 (physically right on both
+        // ends) but an impossible 23.9 °C "skin" under the /128 once assumed here. Raw kept in the record;
+        // consumers divide by 100 (matches Android). The /100 derivation also passes the [5,45] gate.
         XCTAssertEqual(p["skin_temp_raw"]?.intValue, 3057)
+        XCTAssertEqual(Double(p["skin_temp_raw"]?.intValue ?? 0) / 100.0, 30.57, accuracy: 0.01)
+        // Two auxiliary thermal channels (@69/@71), each value/10 = °C, tracking skin_temp.
+        XCTAssertEqual(p["temp_aux_1_raw"]?.intValue, 247)   // 24.7 °C
+        XCTAssertEqual(p["temp_aux_2_raw"]?.intValue, 265)   // 26.5 °C
         // dynamic (gravity-removed) acceleration — small for a still wrist, gated to [0, 8] g.
         let dyn = p["dynamic_acceleration"]?.doubleValue ?? -1
         XCTAssertTrue((0.0...8.0).contains(dyn))
@@ -74,16 +78,86 @@ final class Whoop5HistoricalTests: XCTestCase {
         XCTAssertEqual(p["motion_wear_quality"]?.intValue, 0)
     }
 
+    func testHistoricalV18ObservedFields() {
+        // Fields read off this same real worn frame and justified by their observed behaviour:
+        //  @11 record_index — a per-record counter (+1/record, independent of unix; seen on two straps)
+        //  @36 hr_fixed_8_8 — value/256 tracks hr@22 to sub-bpm (here 25997/256 ≈ 101.55 ≈ HR 102)
+        //  @59 step_cadence — a cadence-like byte (never 0; lower when moving faster)
+        //  @75 status_word — a 16-bit word that is NOT a deep-sleep marker
+        //  @81 sleep_state — high nibble = band state (worn daytime frame = wake)
+        //  @33/@38/@40 — raw bytes near the HR/R-R fields; @113 — a float of unknown purpose
+        let p = parseFrame(bytes(historicalHex), family: .whoop5).parsed
+        XCTAssertEqual(p["record_index"]?.intValue, 25443699)
+        XCTAssertEqual(p["hr_fixed_8_8"]?.intValue, 25997)
+        XCTAssertEqual((p["hr_fixed_8_8"]?.intValue ?? 0) / 256, 101)   // ≈ hr@22 (102)
+        XCTAssertEqual(p["step_cadence"]?.intValue, 170)
+        XCTAssertEqual(p["status_word"]?.intValue, 1792)
+        XCTAssertEqual(p["sleep_state"]?.intValue, 0)
+        XCTAssertEqual(p["rr_packed"]?.intValue, 25444)
+        XCTAssertEqual(p["cardiac_flags"]?.intValue, 0)
+        XCTAssertEqual(p["cardiac_status"]?.intValue, 255)
+        XCTAssertEqual(p["unknown_f32_113"]?.doubleValue ?? 0, -5.2307, accuracy: 0.001)
+    }
+
+    func testHistoricalV18StatusWordSiblings() {
+        // @77 / @79 are near-static siblings of status_word@75, distinguished by their low nibble (1, 2).
+        // Read off this real worn frame (3073 = 0x0C01, 3074 = 0x0C02).
+        let p = parseFrame(bytes(historicalHex), family: .whoop5).parsed
+        XCTAssertEqual(p["status_word_1"]?.intValue, 3073)
+        XCTAssertEqual(p["status_word_2"]?.intValue, 3074)
+        XCTAssertEqual((p["status_word_1"]?.intValue ?? 0) & 0xF, 1)
+        XCTAssertEqual((p["status_word_2"]?.intValue ?? 0) & 0xF, 2)
+    }
+
+    func testHistoricalV18OnWristAndWakeQualityBits() {
+        // @81 packs the band state (b4-5) plus an on-wrist/validity flag (b0-1) and a quality code (b2-3).
+        // On the real worn daytime fixture @81 = 0 (all sub-fields 0); override just that byte to exercise
+        // each bitfield independently — decode is not CRC-gated, so an in-memory edit is sufficient.
+        let base = parseFrame(bytes(historicalHex), family: .whoop5).parsed
+        XCTAssertEqual(base["onwrist"]?.intValue, 0)
+        XCTAssertEqual(base["wake_quality"]?.intValue, 0)
+        var f = bytes(historicalHex)
+        // raw 0b00_10_11_01 = 0x2D → sleep_state 2, wake_quality 3, onwrist 1.
+        f[81] = 0x2D
+        let p = parseFrame(f, family: .whoop5).parsed
+        XCTAssertEqual(p["sleep_state"]?.intValue, 2)
+        XCTAssertEqual(p["wake_quality"]?.intValue, 3)
+        XCTAssertEqual(p["onwrist"]?.intValue, 1)
+    }
+
+    func testHistoricalV18AuxByte82() {
+        // @82: a raw byte observed nonzero only while asleep. The real worn daytime fixture has it 0;
+        // override it to confirm it decodes when present (no CRC gate on decode).
+        let base = parseFrame(bytes(historicalHex), family: .whoop5).parsed
+        XCTAssertEqual(base["aux_byte_82"]?.intValue, 0)
+        var f = bytes(historicalHex)
+        f[82] = 0x5A
+        XCTAssertEqual(parseFrame(f, family: .whoop5).parsed["aux_byte_82"]?.intValue, 0x5A)
+    }
+
+    func testHistoricalV18SleepStateMapping() {
+        // @81's high nibble (bits 4-5) is the band's sleep state; the low nibble is sub-flags. Exercise
+        // the mapping by overriding just that byte on the existing real fixture — no extra captures.
+        var f = bytes(historicalHex)
+        for (raw, expected) in [(0x00, 0), (0x10, 1), (0x20, 2), (0x30, 3), (0x25, 2)] {
+            f[81] = UInt8(raw)
+            XCTAssertEqual(parseFrame(f, family: .whoop5).parsed["sleep_state"]?.intValue, expected,
+                           "raw 0x\(String(raw, radix: 16))")
+        }
+    }
+
     func testHistoricalV18SkinTempTracksWristContact() {
-        // Proof @73 is the real skin-temp sensor: worn it reads skin; off-wrist the same thermistor
-        // reads a cooler ambient value — both pass the guard, so a valid-but-cooler off-wrist reading is
-        // still captured rather than dropped. Asserted on the raw register (worn 3057 > off-wrist 2247;
-        // °C = raw/128 → ~23.9 worn / ~17.6 ambient — the absolute scale awaits a contact-thermometer).
+        // Proof @73 is the real skin-temp sensor: worn it reads skin; off-wrist the same sensor reads a
+        // cooler ambient value — both pass the guard, so a valid-but-cooler off-wrist reading is still
+        // captured rather than dropped. Asserted on the raw register (worn 3057 > off-wrist 2247; °C =
+        // raw/100 → 30.6 °C worn skin / 22.5 °C ambient — both physiological, which is why /100 holds).
         let worn = parseFrame(bytes(historicalHex), family: .whoop5).parsed
         let off = parseFrame(bytes(historicalOffWristHex), family: .whoop5).parsed
         XCTAssertEqual(worn["skin_temp_raw"]?.intValue, 3057)
         XCTAssertEqual(off["skin_temp_raw"]?.intValue, 2247)
         XCTAssertLessThan(off["skin_temp_raw"]?.intValue ?? .max, worn["skin_temp_raw"]?.intValue ?? 0)
+        XCTAssertEqual(Double(worn["skin_temp_raw"]?.intValue ?? 0) / 100.0, 30.57, accuracy: 0.01)
+        XCTAssertEqual(Double(off["skin_temp_raw"]?.intValue ?? 0) / 100.0, 22.47, accuracy: 0.01)
     }
 
     func testHeartRateOffsetIsNotTheNaivePlusFour() {

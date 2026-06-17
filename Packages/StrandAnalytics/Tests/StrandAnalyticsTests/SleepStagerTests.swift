@@ -234,6 +234,71 @@ final class SleepStagerTests: XCTestCase {
         XCTAssertFalse(SleepStager.passesDaytimeGuard(p, restingHR: nil, baseline: nil))
     }
 
+    // MARK: - Off-wrist backstop (#500)
+
+    /// A long, still DAYTIME stretch where the HR stream has a >20-min contiguous gap (the strap was
+    /// off the wrist, so it banked no HR there) must NOT be classified as sleep. Before the off-wrist
+    /// backstop the gravity spine read the stillness as sleep and the daytime guard let it through as
+    /// "missing data" (nil restingHR) → a phantom daytime sleep. Here the dip-confirming HR before the
+    /// gap would even satisfy the daytime guard's resting-HR bar, so ONLY the HR-gap backstop rejects it.
+    func testOffWristDaytimeGapNotSleep() {
+        let dayStart = daytimeStart(10)             // 10:00 active context, HR 72 (lifts the baseline)
+        let dayDur = 2 * 60 * 60
+        let dayGrav = activeGravity(start: dayStart, durationS: dayDur)
+        let dayHR = hrStream(start: dayStart, durationS: dayDur, bpm: 72)
+
+        // 12:00 the strap goes still on a desk for 2 h (≥90-min daytime minimum, center in [11,20)).
+        let offStart = dayStart + dayDur
+        let offDur = 2 * 60 * 60
+        let offGrav = stillGravity(start: offStart, durationS: offDur)
+        // HR covers only the FIRST 20 min at a low 50 bpm (a real dip that would pass the daytime
+        // guard), then NOTHING for the rest — a >20-min contiguous off-wrist gap.
+        let offHR = hrStream(start: offStart, durationS: 20 * 60, bpm: 50)
+
+        let sessions = SleepStager.detectSleep(hr: dayHR + offHR, gravity: dayGrav + offGrav)
+        XCTAssertTrue(sessions.isEmpty,
+                      "a still daytime stretch with a >20-min HR-coverage gap is off-wrist, not sleep")
+    }
+
+    /// The off-wrist backstop must NOT suppress a genuine worn night: dense 1 Hz HR has no gap, so the
+    /// same 90-min still overnight window still registers as exactly one session.
+    func testWornNightWithDenseHRStillRegisters() {
+        let start = nightStart(02)
+        let dur = 90 * 60
+        let grav = stillGravity(start: start, durationS: dur)
+        let hr = hrStream(start: start, durationS: dur, bpm: 50)
+        let sessions = SleepStager.detectSleep(hr: hr, gravity: grav)
+        XCTAssertEqual(sessions.count, 1, "a worn night with dense, gap-free HR must still register")
+    }
+
+    /// The explicit-event path (#500 bonus): a WRIST_OFF event landing inside an otherwise-valid
+    /// overnight window drops it, even though the HR here is dense and gap-free.
+    func testWristOffEventDropsRun() {
+        let start = nightStart(02)
+        let dur = 90 * 60
+        let grav = stillGravity(start: start, durationS: dur)
+        let hr = hrStream(start: start, durationS: dur, bpm: 50)
+        // No event → registers (control); a WRIST_OFF mid-window → dropped.
+        XCTAssertEqual(SleepStager.detectSleep(hr: hr, gravity: grav).count, 1)
+        let withEvent = SleepStager.detectSleep(hr: hr, gravity: grav, wristOff: [start + 30 * 60])
+        XCTAssertTrue(withEvent.isEmpty, "a WRIST_OFF event inside the run must drop it")
+    }
+
+    /// The HR-gap helper is precise about the threshold and edges: a gap at/under 20 min is fine, a
+    /// gap over it trips, and a run with NO HR at all leaves the gravity-only path to the other guards.
+    func testHasOffWristHRGapBoundaries() {
+        let p = SleepStager.Period(stage: "sleep", start: 0, end: 3_600)
+        // Dense coverage → no gap.
+        let dense = (0...3_600).map { HRSample(ts: $0, bpm: 50) }
+        XCTAssertFalse(SleepStager.hasOffWristHRGap(p, hr: dense))
+        // A single 21-min interior gap (> 20 min) → tripped.
+        let gappy = (0...600).map { HRSample(ts: $0, bpm: 50) }
+                  + (1_860...3_600).map { HRSample(ts: $0, bpm: 50) }   // gap 600→1860 = 1260 s > 1200
+        XCTAssertTrue(SleepStager.hasOffWristHRGap(p, hr: gappy))
+        // No HR stream at all → false (can't assert off-wrist without HR; other guards handle it).
+        XCTAssertFalse(SleepStager.hasOffWristHRGap(p, hr: []))
+    }
+
     // MARK: - Staging output integrity
 
     func testStagesTileSessionExactly() {

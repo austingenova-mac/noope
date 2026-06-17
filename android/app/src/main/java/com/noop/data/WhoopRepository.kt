@@ -231,13 +231,24 @@ class WhoopRepository(private val dao: WhoopDao) {
         dao.hrBuckets(deviceId, from, to, bucketSeconds)
 
     /**
-     * DISPLAY-ONLY: fill missing workout HR from the strap's own samples (#77). An imported session
-     * (Health Connect / Apple Health) stores avgHr = null, but if the strap was worn during that
-     * window its ~1 Hz samples are already in Room under the strap device id — so derive avg/max
-     * from them. Fills only rows whose avgHr is null (never mixes sources within a row), requires
-     * [minSamples] (~1 min of data) so a few stray samples can't fabricate an average, and caps the
-     * lookups so a huge history can't jank first paint. NEVER persisted — a re-import must not see
-     * UI-derived values (the workout PK upsert would wipe them anyway).
+     * DISPLAY-ONLY: reconcile a workout's shown HR with the strap trace that actually drives its
+     * graph / zones / effort (#77, #499). The detail screen always charts and zone-bins the strap's
+     * own ~1 Hz samples over [startTs, endTs] (under [strapDeviceId]); the displayed Avg HR comes from
+     * the stored `avgHr` column. Those two can DIVERGE — a hand-edited Avg (128→139) changes the number
+     * but not the trace, so the average no longer matches the graph/zones/effort (#499). Here we make the
+     * stored field defer to the trace whenever the trace is present:
+     *
+     *  - STRAP-NATIVE rows (source "manual" or detected "<id>-noop") are charted/zoned/scored straight
+     *    from this strap trace, so their Avg HR is ALWAYS recomputed as the true mean of those samples —
+     *    a manual edit can no longer drift it out of agreement with the graph. (max likewise → true peak.)
+     *  - IMPORTED rows (Apple Health / Health Connect / Whoop CSV) carry their OWN avg/max from the
+     *    import; we only FILL them when null (and the strap happened to be worn), never override a real
+     *    imported value with strap-derived numbers.
+     *
+     * Requires [minSamples] (~1 min of data) so a few stray samples can't fabricate an average, and caps
+     * the lookups so a huge history can't jank first paint. NEVER persisted — the derived value is a
+     * read-time projection of the trace (the workout PK upsert would wipe it anyway, and re-deriving on
+     * every load keeps display == graph == zones == effort by construction).
      */
     suspend fun fillWorkoutHrFromStrap(
         rows: List<WorkoutRow>,
@@ -247,11 +258,23 @@ class WhoopRepository(private val dao: WhoopDao) {
     ): List<WorkoutRow> {
         var budget = cap
         return rows.map { row ->
-            if (row.avgHr != null || row.endTs <= row.startTs || budget <= 0) return@map row
+            if (row.endTs <= row.startTs || budget <= 0) return@map row
+            // Strap-native rows are graphed/zoned/scored from the strap trace, so their Avg HR must come
+            // from that same trace (recompute, overriding any stored/edited value). Imported rows keep
+            // their own avg/max and are only filled when missing.
+            val src = row.source.lowercase()
+            val strapNative = src == "manual" || src.endsWith("-noop")
+            if (!strapNative && row.avgHr != null) return@map row
             budget -= 1
             val stats = dao.hrWindowStats(strapDeviceId, row.startTs, row.endTs)
             if (stats.n >= minSamples && stats.avg != null && stats.max != null) {
-                row.copy(avgHr = stats.avg.roundToInt(), maxHr = row.maxHr ?: stats.max)
+                if (strapNative) {
+                    // True mean / peak of the very samples the graph + zones + effort use.
+                    row.copy(avgHr = stats.avg.roundToInt(), maxHr = stats.max)
+                } else {
+                    // Imported row with no avg — fill from strap, preserving any imported max.
+                    row.copy(avgHr = stats.avg.roundToInt(), maxHr = row.maxHr ?: stats.max)
+                }
             } else row
         }
     }

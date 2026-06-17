@@ -152,7 +152,14 @@ final class IntelligenceEngine: ObservableObject {
             let day = AnalyticsEngine.dayString(dayStart, offsetSec: tzOffset)
             // Read a generous window around the night that ends on `day`; the stager finds the span.
             let from = dayStart - 30 * 3_600
-            let to = dayStart + 18 * 3_600   // 6 PM — matches the Android window.
+            // Sleep read-window END. For a PAST day the night may end any time before the NEXT local
+            // midnight (late sleepers / weekend lie-ins / shift workers wake well after noon), so a
+            // hard `dayStart + 18h` (6 PM) bound TRUNCATED the read at exactly 18:00 — and a real wake
+            // past it was reported as a flat 18:00 wake (#500). Read a PAST day through to the next
+            // local midnight so the stager sees the whole night; TODAY keeps the 18:00 cap (the store
+            // clamps to `now` anyway, and an in-progress nap shouldn't be read as a finished night).
+            let nextMidnight = dayStart + 86_400
+            let to = (dayStart < nowLocalMidnight) ? nextMidnight : dayStart + 18 * 3_600
 
             // I2: pick the single device that owns this day, and read ITS streams below. With one device
             // this resolves to `deviceId` (active strap, has data → priority 0), so nothing changes; with
@@ -169,6 +176,11 @@ final class IntelligenceEngine: ObservableObject {
             let grav = (try? await store.gravitySamples(deviceId: owner, from: from, to: to, limit: 200_000)) ?? []
             let steps = (try? await store.stepSamples(deviceId: owner, from: from, to: to, limit: 200_000)) ?? []
             let skin = (try? await store.skinTempSamples(deviceId: owner, from: from, to: to, limit: 200_000)) ?? []
+            // WRIST_OFF events in the night window for the off-wrist sleep backstop (#500). The HR-gap
+            // proxy in the stager is the primary guard; these explicit events are a bonus drop of any
+            // run that overlaps one. kind is the strap event label, e.g. "WRIST_OFF(10)".
+            let wristOff = ((try? await store.events(deviceId: owner, from: from, to: to, limit: 50_000)) ?? [])
+                .filter { $0.kind.hasPrefix("WRIST_OFF") }.map { $0.ts }
 
             // Calendar-day window for the ADDITIVE daily totals (steps + calories). The night window
             // above is anchored to the current time-of-day and ends at dayStart+12h, so for a PAST
@@ -196,7 +208,7 @@ final class IntelligenceEngine: ObservableObject {
                                            dayGravity: dayGrav,
                                            skinTemp: skin,
                                            profile: up, baselines: baselines1, maxHROverride: maxHR,
-                                           tzOffsetSeconds: tzOffset)
+                                           tzOffsetSeconds: tzOffset, wristOff: wristOff)
             }.value
             nightlyHrvByDay[res.daily.day] = res.daily.avgHrv
             nightlyRhrByDay[res.daily.day] = res.daily.restingHr.map(Double.init)

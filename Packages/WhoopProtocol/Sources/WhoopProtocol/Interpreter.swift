@@ -40,6 +40,12 @@ public struct ParsedFrame: Codable, Equatable {
     return Int(Int16(bitPattern: raw))
 }
 
+@inline(__always) private func readI32(_ f: [UInt8], _ off: Int) -> Int? {
+    guard off + 4 <= f.count else { return nil }
+    let raw = UInt32(f[off]) | (UInt32(f[off + 1]) << 8) | (UInt32(f[off + 2]) << 16) | (UInt32(f[off + 3]) << 24)
+    return Int(Int32(bitPattern: raw))
+}
+
 @inline(__always) private func readF32(_ f: [UInt8], _ off: Int) -> Double? {
     guard off + 4 <= f.count else { return nil }
     let bits = UInt32(f[off]) | (UInt32(f[off + 1]) << 8) | (UInt32(f[off + 2]) << 16) | (UInt32(f[off + 3]) << 24)
@@ -293,12 +299,21 @@ private func decodeWhoop5Historical(_ frame: [UInt8], fb: FieldBuilder, payloadE
         decodeWhoop5HistoricalV26(frame, fb: fb)
         return
     }
+    if version == 20 || version == 21 {
+        decodeWhoop5HistoricalV2021(frame, fb: fb, version: version, payloadEnd: payloadEnd)
+        return
+    }
     guard version == 18 else {
         // Unknown historical layout — describe it faithfully without inventing offsets.
         if let payloadEnd = payloadEnd, 11 < payloadEnd, payloadEnd <= frame.count {
             fb.region(11, payloadEnd, "HISTORICAL_DATA v\(version) (unmapped layout)", "unknown")
         }
         return
+    }
+    if let idx = readDType(frame, 11, "u32") {
+        // A per-record counter: +1 every record and independent of unix (it advances across gaps);
+        // observed identical on two straps. @11 is only the low byte — read the full u32 LE.
+        fb.add(11, 4, "record_index", "meta", value: .int(idx), note: "per-record counter")
     }
     if let unix = readDType(frame, 15, "u32") {
         fb.add(15, 4, "unix", "time", value: .int(unix), note: "real unix seconds")
@@ -317,16 +332,28 @@ private func decodeWhoop5Historical(_ frame: [UInt8], fb: FieldBuilder, payloadE
         }
     }
     fb.parsed["rr_intervals"] = .intArray(rrs)
+    // Bytes adjacent to the HR/R-R fields, read off real frames. @36 / 256 tracks the integer hr@22 to
+    // sub-bpm (corr 0.989 over ~258k records) — a higher-precision heart rate; the others are raw.
+    if let v = readDType(frame, 33, "u8") {
+        fb.add(33, 1, "cardiac_flags", "cardiac", value: .int(v), note: "raw byte near the HR fields")
+    }
+    if let v = readDType(frame, 36, "u16") {
+        fb.add(36, 2, "hr_fixed_8_8", "hr", value: .int(v), note: "higher-precision HR: bpm = value/256")
+    }
+    if let v = readDType(frame, 38, "u16") {
+        fb.add(38, 2, "rr_packed", "rr", value: .int(v), note: "raw u16 near the R-R fields; meaning not pinned")
+    }
+    if let v = readDType(frame, 40, "u8") {
+        fb.add(40, 1, "cardiac_status", "cardiac", value: .int(v), note: "raw status-like byte near the HR fields")
+    }
     for (name, off) in [("gravity_x", 45), ("gravity_y", 49), ("gravity_z", 53)] {
         if let d = readF32(frame, off) {
             fb.add(off, 4, name, "accel", value: .double(d), note: "g")
         }
     }
-    // Per-second biometric fields beyond HR/gravity. Each is gated to a physically-real range and was
-    // cross-validated against real v18 frames (worn vs off-wrist), so a wrong offset on an unmapped
-    // firmware revision stores nothing rather than garbage (the data is the arbiter). Fields the report
-    // listed but that did NOT decode consistently on this device's firmware (cardiac_flags@33,
-    // state_bitfield@81, perfusion@69/71) are deliberately left in the raw region pending more captures.
+    // Per-second fields beyond HR/gravity, each gated to a physically-real range and cross-validated
+    // against real v18 frames (worn vs off-wrist), so a wrong offset on an unmapped layout stores
+    // nothing rather than garbage (the data is the arbiter).
     if let d = readF32(frame, 41), d.isFinite, (0...8).contains(d) {
         fb.add(41, 4, "dynamic_acceleration", "accel", value: .double(d), note: "g, gravity-removed magnitude")
     }
@@ -335,28 +362,75 @@ private func decodeWhoop5Historical(_ frame: [UInt8], fb: FieldBuilder, payloadE
         // reset. Single-frame value is unbounded so it carries no physical gate here.
         fb.add(57, 2, "step_motion_counter", "activity", value: .int(raw), note: "cumulative motion counter")
     }
+    if let cad = readDType(frame, 59, "u8") {
+        // A per-step cadence-like byte between the step counter and @63: never 0, and lower when moving
+        // faster (still > walk > run in the data). Raw — no unit asserted.
+        fb.add(59, 1, "step_cadence", "activity", value: .int(cad), note: "cadence-like byte (raw)")
+    }
     if let wear = readDType(frame, 63, "u8"), (0...2).contains(wear) {
         fb.add(63, 1, "motion_wear_quality", "quality", value: .int(wear), note: "0=still/good, 1, 2=poor contact")
     }
+    // Two auxiliary thermal channels just before skin_temp. Each is a signed i16 whose value/10 reads as
+    // °C, tracks skin_temp@73 closely (corr ~0.92 and ~0.97 across the captured corpus) and follows the
+    // same diurnal curve. Gated to a plausible thermal range so a wrong offset stores nothing.
+    if let v = readI16(frame, 69), (0...60).contains(Double(v) / 10.0) {
+        fb.add(69, 2, "temp_aux_1_raw", "temp", value: .int(v),
+               note: "secondary temperature channel; °C = value/10; tracks skin_temp (corr ~0.92) with the same diurnal curve")
+    }
+    if let v = readI16(frame, 71), (0...60).contains(Double(v) / 10.0) {
+        fb.add(71, 2, "temp_aux_2_raw", "temp", value: .int(v),
+               note: "secondary temperature channel; °C = value/10; tracks skin_temp (corr ~0.97) with the same diurnal curve")
+    }
     if let raw = readDType(frame, 73, "u16") {
-        // Skin temperature from the AS6221 digital sensor (named in the strap's firmware console logs).
-        // Emitted as the RAW u16 register (`skin_temp_raw`, consumed by the decode-features store) to
-        // stay scale-agnostic; °C = raw / 128 — the AS6221's native 7.8125 m°C/LSB. Verified on real
-        // v18 frames by that exact hardware scale AND a textbook on-wrist warming curve 17.5 → 28 °C as
-        // the sensor equilibrates after donning — a thermal signature nothing else in the record has.
-        // (See docs/BLE_REVERSE_ENGINEERING.md §5.) Gate on a plausible thermal range so a wrong offset
-        // on an unmapped firmware stores nothing rather than garbage; the gate holds under either the
-        // /128 or the alternative /100 reading, so it does not bake in the absolute scale.
-        let celsius = Double(raw) / 128.0
+        // Skin temperature from a digital skin-temperature sensor. Emitted as the RAW u16 register
+        // (`skin_temp_raw`, consumed by the decode-features store) to stay scale-agnostic; °C = raw/100
+        // is the divisor that yields physiological worn skin temps (median ~34 °C across two straps;
+        // 30.6 °C worn / 22.5 °C ambient off-wrist on the test fixtures). The alternative /128 reads a
+        // non-physiological ~27 °C worn (≈23.9 °C on this fixture) and is rejected. The on-wrist warming
+        // curve after donning is a thermal signature nothing else in the record has. Gate on a plausible
+        // thermal range so a wrong offset on an unmapped firmware stores nothing rather than garbage.
+        let celsius = Double(raw) / 100.0
         if (5...45).contains(celsius) {
             fb.add(73, 2, "skin_temp_raw", "temp", value: .int(raw),
-                   note: "AS6221 raw register; °C = raw/128 (≈28 worn; on-wrist warming curve)")
+                   note: "raw register; °C = raw/100 (≈30.6 worn / ~22.5 ambient; on-wrist warming curve)")
         }
     }
-    // The remaining bytes (perfusion, cardiac block, AFE mode register, sleep FSM) are not yet
-    // ground-truth-mapped on this firmware; keep them as one honest raw region.
-    if let payloadEnd = payloadEnd, 75 < payloadEnd, payloadEnd <= frame.count {
-        fb.region(75, payloadEnd, "unmapped (perfusion/cardiac/AFE-mode/sleep-state)", "unknown")
+    if let raw = readDType(frame, 75, "u16") {
+        // A 16-bit status word. NOT a deep-sleep marker: across ~258k records its low nibble is 0 and it
+        // occurs as often awake as asleep (the community "80 = deep" reading is a misread).
+        fb.add(75, 2, "status_word", "status", value: .int(raw), note: "packed status word; not deep-sleep")
+    }
+    if let v = readDType(frame, 77, "u16") {
+        fb.add(77, 2, "status_word_1", "status", value: .int(v),
+               note: "raw; near-static sibling of status_word@75 (low nibble = 1)")
+    }
+    if let v = readDType(frame, 79, "u16") {
+        fb.add(79, 2, "status_word_2", "status", value: .int(v),
+               note: "raw; sibling of @75 (low nibble = 2)")
+    }
+    if let sb = readDType(frame, 81, "u8") {
+        // High nibble (bits 4-5) tracks a scored night: 0 wake / 1 still / 2 asleep / 3 up; low nibble =
+        // sub-flags. Deep/REM/light are computed off-band, not present here.
+        let state = (sb >> 4) & 3
+        fb.add(81, 1, "sleep_state", "sleep", value: .int(state),
+               note: "0 wake/1 still/2 asleep/3 up (band state; not deep/REM/light)")
+        fb.add(81, 1, "onwrist", "sleep", value: .int(sb & 3),
+               note: "on-wrist/validity flag (b0-1)")
+        fb.add(81, 1, "wake_quality", "sleep", value: .int((sb >> 2) & 3),
+               note: "quality code (b2-3); observed nonzero only in wake")
+    }
+    if let v = readDType(frame, 82, "u8") {
+        fb.add(82, 1, "aux_byte_82", "status", value: .int(v),
+               note: "raw; observed nonzero only while sleep_state = asleep (meaning not pinned)")
+    }
+    if let d = readF32(frame, 113), d.isFinite {
+        // A float32 at @113 (observed range ~ -5.3…0, 0 = unset); purpose unknown, carried raw.
+        fb.add(113, 4, "unknown_f32_113", "aux", value: .double(d), note: "float32, purpose unknown")
+    }
+    // The remaining bytes (optical/perfusion + the unmapped tail) are not ground-truth-mapped; keep them
+    // as one honest raw region.
+    if let payloadEnd = payloadEnd, 82 < payloadEnd, payloadEnd <= frame.count {
+        fb.region(82, payloadEnd, "unmapped (optical/perfusion + tail)", "unknown")
     }
 }
 
@@ -396,6 +470,74 @@ private func decodeWhoop5HistoricalV26(_ frame: [UInt8], fb: FieldBuilder) {
                note: "optical PPG @24 Hz, LE-i16 ADC counts")
         fb.parsed["ppg_sample_count"] = .int(samples.count)
     }
+}
+
+/// Decode WHOOP 5.0 type-47 **version-20 / version-21** records — the bulk multi-channel sensor stream
+/// the strap serves alongside the v18 per-second summary. These are large records (v20 = 2140 B, v21 =
+/// 1244 B) that earlier builds could not decode (issue #344): the offload "completed" but stored nothing.
+///
+/// Both versions reuse the v18 record header — layout version @9, a marker byte @10 (0x81 on v20, 0x80 on
+/// v21), the monotonic u32 record index @11 (the same lifetime counter as v18), and the u32 unix second
+/// @15. Their bodies are blocks of fixed-length sample channels, established from captured frames:
+///   • v21 (1244 B): a (100, 100, 3) descriptor near @22, then three 100-sample i16 channels at @28 /
+///     @228 / @428 (200 B apart), each a bounded pulsatile waveform at its own DC baseline.
+///   • v20 (2140 B): five channel blocks, each preceded by a presence byte (0x19 = active, 0x00 =
+///     empty / zero-filled); an active block holds two 50-sample i32 channels. The presence bytes sit at
+///     @0x1a / @0x1c0 / @0x366 / @0x50c / @0x6b2; the ten channel slots start at
+///     @0x2f / 0xf7 / 0x1d5 / 0x29d / 0x37b / 0x443 / 0x521 / 0x5e9 / 0x6c7 / 0x78f.
+///
+/// Channels are exposed as raw sample arrays with NO invented scale or unit (an optical waveform has no
+/// absolute unit). Which channel maps to which optical LED — and which carries motion — needs a labelled
+/// capture (e.g. a deliberate moving window), so no per-channel identity is asserted here.
+private func decodeWhoop5HistoricalV2021(_ frame: [UInt8], fb: FieldBuilder, version: Int, payloadEnd: Int?) {
+    if frame.count > 10 {
+        fb.add(10, 1, "layout_marker", "meta", value: .int(Int(frame[10])))
+    }
+    if let idx = readU32(frame, 11) {
+        fb.add(11, 4, "record_index", "meta", value: .int(idx), note: "monotonic lifetime record index")
+    }
+    if let unix = readU32(frame, 15) {
+        fb.add(15, 4, "unix", "time", value: .int(unix), note: "real unix seconds")
+    }
+    if version == 21 {
+        // Three 100-sample i16 channels, 200 B apart.
+        for (ch, start) in [(0, 28), (1, 228), (2, 428)] {
+            var samples: [Int] = []
+            for i in 0..<100 {
+                guard let v = readI16(frame, start + i * 2) else { break }
+                samples.append(v)
+            }
+            if samples.count == 100 {
+                fb.add(start, 200, "optical_ch\(ch)", "ppg", value: .intArray(samples),
+                       note: "raw i16 channel samples (no absolute unit)")
+            }
+        }
+        fb.parsed["sensor_channel_samples"] = .int(100)
+        return
+    }
+    // version == 20: five blocks of two 50-sample i32 channels, each block gated by a presence byte.
+    let blocks: [(present: Int, ch0: Int, ch1: Int)] = [
+        (0x1a, 0x2f, 0xf7), (0x1c0, 0x1d5, 0x29d), (0x366, 0x37b, 0x443),
+        (0x50c, 0x521, 0x5e9), (0x6b2, 0x6c7, 0x78f),
+    ]
+    var present = 0
+    for (b, blk) in blocks.enumerated() {
+        guard frame.count > blk.present, frame[blk.present] != 0 else { continue }
+        for (half, start) in [(0, blk.ch0), (1, blk.ch1)] {
+            var samples: [Int] = []
+            for i in 0..<50 {
+                guard let v = readI32(frame, start + i * 4) else { break }
+                samples.append(v)
+            }
+            if samples.count == 50 {
+                fb.add(start, 200, "channel_b\(b)_\(half)", "sensor", value: .intArray(samples),
+                       note: "raw i32 channel samples (no absolute unit)")
+                present += 1
+            }
+        }
+    }
+    fb.parsed["sensor_channel_samples"] = .int(50)
+    fb.parsed["sensor_channels_present"] = .int(present)
 }
 
 /// Decode WHOOP 5.0 METADATA (type 49) chunk fields so the historical-offload state machine can act

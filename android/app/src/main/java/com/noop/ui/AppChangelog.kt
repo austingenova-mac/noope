@@ -25,7 +25,7 @@ object AppChangelog {
      * Bump this when you add a release below. The "What's New" sheet shows automatically when the
      * stored last-seen version is behind this. (Decoupled from the bundle version on purpose.)
      */
-    const val CURRENT_VERSION = "4.4.0"
+    const val CURRENT_VERSION = "4.5.0"
 
     data class Release(
         val version: String,
@@ -36,6 +36,18 @@ object AppChangelog {
 
     /** Newest first. */
     val releases: List<Release> = listOf(
+        Release(
+            version = "4.5.0",
+            title = "WHOOP 5/MG deep-sync decode + sleep & workout fixes",
+            date = "June 2026",
+            items = listOf(
+                "**More of your WHOOP 5/MG history now syncs.** Some nights were stored by the strap in newer record layouts (internally \"v20/v21\") that NOOP didn't recognise yet, so they were skipped and showed up as empty. Those now decode — so more of your 5/MG history comes through. We also pull richer detail from the existing records (higher-precision heart rate, step cadence, an extra skin-temperature channel) and corrected the skin-temperature scale so worn readings land where they should. *(Thanks to community contributor j0b-dev for the captured-frame analysis behind this.)*",
+                "**Sleep: no more daytime false sleep.** Time with the strap off your wrist — on the charger, or sat at a desk — could occasionally be logged as sleep. NOOP now spots those gaps (a long stretch with no real heart-rate signal, or an explicit off-wrist marker) and won't count them as sleep, day or night.",
+                "**Sleep: fixed a 6 PM wake-time clamp.** On some past nights your wake time could be reported as exactly 6 PM — an artefact of the read window ending there, not your real wake. Past nights now read through the full day so your true wake time shows.",
+                "**Workouts: Average HR always matches the trace.** A workout's Average HR is now always computed from the exact heart-rate samples behind the graph and zones, so the number and the chart can never drift apart.",
+                "Fixed a build warning and repaired the macOS/iOS download links for the 4.4.0 release.",
+            ),
+        ),
         Release(
             version = "4.4.0",
             title = "Classic chart colours — a throwback toggle",
